@@ -82,7 +82,7 @@ export default class AtMentionLinkerPlugin extends Plugin {
 		keys.add(canonicalKey);
 
 		if (fm) {
-			const possibleAliases = [fm.alias, fm.aliases].filter((v) => v !== undefined && v !== null);
+			const possibleAliases = [fm.alias, fm.aliases].filter((v) => v != null);
 
 			for (const entry of possibleAliases) {
 				if (!entry) continue;
