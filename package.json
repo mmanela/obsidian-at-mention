@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "obsidian-at-mention-linker",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "On file save, converts @name to [[Page]] if a matching note name or alias exists.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
@@ -11,6 +11,7 @@
 		"lint": "eslint ."
 	},
 	"keywords": [],
+	"author": "mmanela",
 	"license": "0-BSD",
 	"devDependencies": {
 		"@types/node": "^16.11.6",

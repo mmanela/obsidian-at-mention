@@ -1,99 +1,179 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { MarkdownView, Notice, parseLinktext, Plugin, TAbstractFile, TFile } from 'obsidian';
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class AtMentionLinkerPlugin extends Plugin {
+	private aliasMap: Map<string, string> = new Map();
+	private fileKeyMap: Map<string, Set<string>> = new Map();
+	private isProcessing = false;
 
 	async onload() {
-		await this.loadSettings();
+		await this.buildInitialAliasMap();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		// Auto run on file modification (save)
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => this.onFileModify(file))
+		);
+
+		// Manual command
+		this.addCommand({
+			id: "run-on-active-file",
+			name: "Convert @mentions to links in active file",
+			callback: () => this.runOnActiveFile(),
 		});
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+		// Keep aliasMap in sync with vault changes
+		this.registerEvent(
+			this.app.metadataCache.on("changed", (file) => this.updateAliasEntriesForFile(file))
+		);
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile) {
+					this.removeAliasEntriesForFile(file);
 				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (file instanceof TFile) {
+					this.updateAliasEntriesForFile(file);
+				}
+			})
+		);
 	}
 
 	onunload() {
+		// Cleanup is handled automatically by Obsidian
 	}
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+	private async buildInitialAliasMap() {
+		const { vault } = this.app;
+
+		for (const file of vault.getMarkdownFiles()) {
+			this.addOrUpdateFileAliases(file);
+		}
 	}
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+	private updateAliasEntriesForFile(file: TFile) {
+		if (file.extension !== "md") return;
+		this.removeAliasEntriesForFile(file);
+		this.addOrUpdateFileAliases(file);
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	private removeAliasEntriesForFile(file: TFile) {
+		const keys = this.fileKeyMap.get(file.path);
+		if (!keys) return;
+
+		for (const key of keys) {
+			this.aliasMap.delete(key);
+		}
+		this.fileKeyMap.delete(file.path);
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	private addOrUpdateFileAliases(file: TFile) {
+		const { metadataCache } = this.app;
+		const cache = metadataCache.getFileCache(file);
+		const fm = cache?.frontmatter;
+
+		const canonical = file.basename;
+		const canonicalKey = canonical.toLowerCase();
+		const keys = new Set<string>();
+
+		// Always map the filename itself
+		this.aliasMap.set(canonicalKey, canonical);
+		keys.add(canonicalKey);
+
+		if (fm) {
+			const possibleAliases = [fm.alias, fm.aliases].filter((v) => v !== undefined && v !== null);
+
+			for (const entry of possibleAliases) {
+				if (!entry) continue;
+
+				if (Array.isArray(entry)) {
+					for (const item of entry) {
+						if (typeof item === "string") {
+							const trimmed = item.trim();
+							if (trimmed) {
+								const key = trimmed.toLowerCase();
+								this.aliasMap.set(key, canonical);
+								keys.add(key);
+							}
+						}
+					}
+				} else if (typeof entry === "string") {
+					const trimmed = entry.trim();
+					if (trimmed) {
+						const key = trimmed.toLowerCase();
+						this.aliasMap.set(key, canonical);
+						keys.add(key);
+					}
+				}
+			}
+		}
+
+		this.fileKeyMap.set(file.path, keys);
+	}
+
+	private onFileModify(file: TAbstractFile) {
+		// Prevent infinite loop from our own modifications
+		if (this.isProcessing) return;
+		
+		if (!(file instanceof TFile)) return;
+		
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view || view.file?.path !== file.path) return;
+		
+		this.processFile(view);
+	}
+
+	private runOnActiveFile() {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view) return;
+		this.processFile(view);
+	}
+
+	private processFile(view: MarkdownView) {
+		const editor = view.editor;
+		const originalText = editor.getValue();
+
+		const mentionRegex = /@([A-Za-z0-9 _-]+)/g;
+		let changed = false;
+
+		const replacedText = originalText.replace(mentionRegex, (fullMatch, rawName: string) => {
+			if (typeof rawName !== "string") return fullMatch;
+			
+			const normalized = rawName.trim();
+			if (!normalized) return fullMatch;
+
+			// Use parseLinktext to handle any special characters
+			const { path } = parseLinktext(normalized);
+
+			// First try Obsidian's own link resolution
+			const sourcePath = view.file?.path ?? "";
+			const dest = this.app.metadataCache.getFirstLinkpathDest(path, sourcePath);
+
+			let canonical: string | undefined;
+
+			if (dest) {
+				canonical = dest.basename;
+			} else {
+				// Fallback to alias map
+				const key = normalized.toLowerCase();
+				canonical = this.aliasMap.get(key);
+			}
+
+			if (canonical) {
+				changed = true;
+				return `[[${canonical}]]`;
+			}
+
+			return fullMatch;
+		});
+
+		if (changed) {
+			// Set flag to prevent infinite loop
+			this.isProcessing = true;
+			editor.setValue(replacedText);
+			this.isProcessing = false;
+			new Notice("Converted @mentions to links");
+		}
 	}
 }
